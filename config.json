@@ -1,0 +1,19 @@
+{
+    "target_device": "/dev/sdc",
+    "device_type": "sntrealtek",
+    "device_label": "USB-C NVMe (Realtek)",
+    "refresh_rate_sec": 1,
+    "opacity": 0.6,
+    "position": "top-right",
+    "offset_x": 25,
+    "offset_y": 25,
+    "sensor2_good_threshold_c": 60,
+    "sensor2_high_threshold_c": 75,
+    "sensor2_critical_threshold_c": 85,
+    "enable_notifications": true,
+    "run_at_startup": false,
+    "smartctl_path": "C:\\Program Files\\smartmontools\\bin\\smartctl.exe",
+    "good_threshold_c": 55,
+    "high_threshold_c": 70,
+    "critical_threshold_c": 80
+}
