@@ -5,7 +5,7 @@
     "device_type": "nvme",
     "device_label": "Internal NVMe (nvme0)",
     "refresh_rate_sec": 1,
-    "opacity": 0.6,
+    "opacity": 0.4,
     "position": "top-right",
     "offset_x": 25,
     "offset_y": 25,
