@@ -28,12 +28,24 @@ if ! python3 -c "import PyQt5" &> /dev/null; then
     echo ""
 fi
 
-# 4. Launch with root permissions to query raw SMART disk data
-# Note: -E preserves the user's DISPLAY / XAUTHORITY / WAYLAND environment for the GUI
+# 4. Allow X11 root display access for GUI if needed
+if command -v xhost &> /dev/null; then
+    xhost +si:localuser:root 2>/dev/null || true
+fi
+
+# 5. Launch NVMe Temperature Monitor
 echo "[+] Starting NVMe Temperature Monitor..."
 if [ "$EUID" -ne 0 ]; then
-    sudo -E python3 "$SCRIPT_DIR/nvme_monitor.py" "$@" &
+    # Authenticate sudo interactively in foreground so password prompt works properly
+    if [ -t 0 ] && sudo -v 2>/dev/null; then
+        sudo modprobe drivetemp 2>/dev/null || true
+        sudo -E python3 "$SCRIPT_DIR/nvme_monitor.py" "$@" &
+    else
+        # Launch unprivileged (works with sysfs hwmon and user in disk group)
+        python3 "$SCRIPT_DIR/nvme_monitor.py" "$@" &
+    fi
 else
+    modprobe drivetemp 2>/dev/null || true
     python3 "$SCRIPT_DIR/nvme_monitor.py" "$@" &
 fi
 

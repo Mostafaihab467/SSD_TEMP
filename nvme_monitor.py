@@ -1,5 +1,7 @@
 import sys
 import os
+import glob
+import re
 import json
 import subprocess
 import shutil
@@ -12,7 +14,9 @@ CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.j
 IS_WINDOWS = sys.platform == "win32"
 
 DEFAULT_CONFIG = {
-    "target_device": "/dev/sdc",
+    "target_device": "/dev/sdc" if IS_WINDOWS else "/dev/sdb",
+    "target_device_windows": "/dev/sdc",
+    "target_device_linux": "/dev/sdb",
     "device_type": "sntrealtek",
     "device_label": "USB-C NVMe (Realtek)",
     "refresh_rate_sec": 2,
@@ -47,12 +51,225 @@ def elevate_if_needed():
             if result > 32:
                 sys.exit(0)
         else:
-            # On Linux, try re-executing with sudo -E to preserve X11/Wayland DISPLAY
-            script = os.path.abspath(__file__)
+            # On Linux: only re-exec with sudo if running in an interactive terminal
+            # Avoid breaking headless/autostart launches when no TTY is available
+            if sys.stdin and sys.stdin.isatty() and os.environ.get("SUDO_ATTEMPTED") != "1":
+                script = os.path.abspath(__file__)
+                try:
+                    env = os.environ.copy()
+                    env["SUDO_ATTEMPTED"] = "1"
+                    os.execvpe("sudo", ["sudo", "-E", sys.executable, script] + sys.argv[1:], env)
+                except Exception as e:
+                    print("Note: Running unprivileged on Linux:", e)
+
+def scan_drives():
+    drives = []
+    smartctl = shutil.which("smartctl") or ("/usr/sbin/smartctl" if not IS_WINDOWS else DEFAULT_CONFIG["smartctl_path"])
+    
+    if smartctl and os.path.exists(smartctl):
+        try:
+            startupinfo = None
+            creationflags = 0
+            if IS_WINDOWS:
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = 0
+                creationflags = 0x08000000
+            p = subprocess.run(
+                [smartctl, "--scan"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=2,
+                startupinfo=startupinfo,
+                creationflags=creationflags
+            )
+            for line in p.stdout.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                match = re.match(r"^(\S+)\s+-d\s+(\S+)\s*(?:#\s*(.*))?", line)
+                if match:
+                    dev, dtype, comment = match.groups()
+                    comment = comment.strip() if comment else ""
+                    label = comment if comment else f"{dev} ({dtype})"
+                    if "Realtek" in comment or "sntrealtek" in dtype:
+                        label = "USB-C NVMe (Realtek)"
+                    elif "Kingston" in comment:
+                        label = "Internal M.2 NVMe (Kingston)"
+                    elif "NVMe" in comment or dtype == "nvme":
+                        label = f"Internal NVMe ({os.path.basename(dev)})"
+                    drives.append({
+                        "device": dev,
+                        "type": dtype,
+                        "label": label,
+                        "comment": comment
+                    })
+        except Exception:
+            pass
+
+    # On Linux, also scan sysfs hwmon for internal NVMe drives
+    if not IS_WINDOWS:
+        for hwmon in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
             try:
-                os.execvp("sudo", ["sudo", "-E", sys.executable, script] + sys.argv[1:])
-            except Exception as e:
-                print("Failed to elevate with sudo:", e)
+                name_p = os.path.join(hwmon, "name")
+                if os.path.exists(name_p) and open(name_p).read().strip() == "nvme":
+                    dev_p = os.path.realpath(os.path.join(hwmon, "device"))
+                    dev_base = os.path.basename(dev_p)
+                    dev_node = f"/dev/{dev_base}"
+                    if not any(d["device"] == dev_node or (d["device"].startswith("/dev/nvme") and dev_node.startswith("/dev/nvme")) for d in drives):
+                        drives.append({
+                            "device": dev_node,
+                            "type": "nvme",
+                            "label": f"Internal NVMe ({dev_base})",
+                            "comment": f"hwmon ({os.path.basename(hwmon)})"
+                        })
+            except Exception:
+                pass
+
+    return drives
+
+def read_hwmon_nvme(target=None):
+    """
+    Directly reads NVMe temperatures from Linux /sys/class/hwmon without requiring root.
+    Returns (s1, s2, composite, error_string)
+    """
+    if IS_WINDOWS:
+        return None, None, None, "hwmon only available on Linux"
+        
+    nvme_name = ""
+    if target:
+        base = os.path.basename(target)
+        match = re.match(r"(nvme\d+)", base)
+        if match:
+            nvme_name = match.group(1)
+            
+    for hwmon in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+        try:
+            name_p = os.path.join(hwmon, "name")
+            if not os.path.exists(name_p):
+                continue
+            with open(name_p, "r") as f:
+                hname = f.read().strip()
+                
+            if hname != "nvme":
+                continue
+                
+            dev_p = os.path.realpath(os.path.join(hwmon, "device"))
+            if nvme_name and nvme_name not in os.path.basename(dev_p):
+                continue
+                
+            composite = None
+            s1 = None
+            s2 = None
+            labels = {}
+            for input_file in sorted(glob.glob(os.path.join(hwmon, "temp*_input"))):
+                prefix = input_file[:-6]
+                lbl_file = prefix + "_label"
+                lbl_text = ""
+                if os.path.exists(lbl_file):
+                    try:
+                        with open(lbl_file, "r") as f:
+                            lbl_text = f.read().strip().lower()
+                    except:
+                        pass
+                if not lbl_text:
+                    lbl_text = os.path.basename(prefix).lower()
+                    
+                try:
+                    with open(input_file, "r") as f:
+                        val = round(int(f.read().strip()) / 1000.0)
+                        labels[lbl_text] = val
+                except:
+                    pass
+                    
+            for lbl, val in labels.items():
+                if "composite" in lbl:
+                    composite = val
+                elif "sensor 1" in lbl or "nand" in lbl or "flash" in lbl:
+                    s1 = val
+                elif "sensor 2" in lbl or "controller" in lbl or "asic" in lbl:
+                    s2 = val
+                    
+            if composite is None and "temp1" in labels:
+                composite = labels["temp1"]
+            if s1 is None:
+                s1 = composite
+            if s2 is None:
+                for lbl, val in labels.items():
+                    if val != composite:
+                        s2 = val
+                        break
+                if s2 is None:
+                    s2 = composite
+                    
+            if s1 is not None or s2 is not None:
+                return s1, s2, composite, None
+        except Exception:
+            continue
+            
+    return None, None, None, "No matching NVMe hwmon sensor found"
+
+def resolve_target_device(config):
+    target = config.get("target_device", "")
+    dev_type = config.get("device_type", "")
+    label = config.get("device_label", "")
+
+    if IS_WINDOWS:
+        target = config.get("target_device_windows") or target or "/dev/sdc"
+        return target, dev_type, label
+
+    # On Linux:
+    # If current target exists on Linux, use it
+    if target and (os.path.exists(target) or target.startswith("/dev/nvme")):
+        return target, dev_type, label
+
+    # Check target_device_linux
+    target_linux = config.get("target_device_linux")
+    if target_linux and (os.path.exists(target_linux) or target_linux.startswith("/dev/nvme")):
+        config["target_device"] = target_linux
+        return target_linux, dev_type, label
+
+    # Auto-resolve using scanned drives on Linux
+    drives = scan_drives()
+    matched = None
+
+    if dev_type:
+        for d in drives:
+            if d.get("type") == dev_type:
+                matched = d
+                break
+
+    if not matched and label:
+        lbl_lower = label.lower()
+        for d in drives:
+            d_lbl = d.get("label", "").lower()
+            d_cmt = d.get("comment", "").lower()
+            if ("realtek" in lbl_lower and ("realtek" in d_lbl or "realtek" in d_cmt)) or \
+               ("kingston" in lbl_lower and ("kingston" in d_lbl or "kingston" in d_cmt or d.get("type") == "nvme")) or \
+               ("nvme" in lbl_lower and d.get("type") == "nvme"):
+                matched = d
+                break
+
+    if not matched and drives:
+        for d in drives:
+            if d.get("type") in ("sntrealtek", "nvme"):
+                matched = d
+                break
+        if not matched:
+            matched = drives[0]
+
+    if matched:
+        target = matched["device"]
+        dev_type = matched["type"]
+        label = matched["label"]
+        config["target_device"] = target
+        config["target_device_linux"] = target
+        config["device_type"] = dev_type
+        config["device_label"] = label
+        save_config(config)
+
+    return target, dev_type, label
 
 def load_config():
     cfg = DEFAULT_CONFIG.copy()
@@ -63,19 +280,29 @@ def load_config():
                 cfg.update(user_cfg)
         except Exception as e:
             print("Error loading config:", e)
-            
-    # Auto-detect smartctl on Linux if Windows path was left in config
-    if not IS_WINDOWS:
+
+    if IS_WINDOWS:
+        if not cfg.get("smartctl_path") or not os.path.exists(cfg.get("smartctl_path", "")):
+            cfg["smartctl_path"] = shutil.which("smartctl") or DEFAULT_CONFIG["smartctl_path"]
+        if cfg.get("target_device_windows"):
+            cfg["target_device"] = cfg["target_device_windows"]
+    else:
         current_smartctl = cfg.get("smartctl_path", "")
-        if not os.path.exists(current_smartctl):
+        if not current_smartctl or not os.path.exists(current_smartctl):
             detected = shutil.which("smartctl") or "/usr/sbin/smartctl" or "/usr/bin/smartctl"
             if os.path.exists(detected):
                 cfg["smartctl_path"] = detected
+        resolve_target_device(cfg)
 
     return cfg
 
 def save_config(cfg):
     try:
+        if IS_WINDOWS:
+            cfg["target_device_windows"] = cfg.get("target_device")
+        else:
+            cfg["target_device_linux"] = cfg.get("target_device")
+
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=4)
     except Exception as e:
@@ -97,7 +324,9 @@ def manage_startup_task(enable=True):
         subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     else:
         # Linux Autostart via ~/.config/autostart
-        autostart_dir = os.path.expanduser("~/.config/autostart")
+        # Use actual user's home directory even if running under sudo
+        user_home = os.path.expanduser(f"~{os.environ['SUDO_USER']}") if "SUDO_USER" in os.environ else os.path.expanduser("~")
+        autostart_dir = os.path.join(user_home, ".config", "autostart")
         desktop_file = os.path.join(autostart_dir, "nvme_monitor.desktop")
         if enable:
             os.makedirs(autostart_dir, exist_ok=True)
@@ -116,7 +345,10 @@ Categories=System;Monitor;
                 print("Failed to write autostart desktop file:", e)
         else:
             if os.path.exists(desktop_file):
-                os.remove(desktop_file)
+                try:
+                    os.remove(desktop_file)
+                except Exception:
+                    pass
 
 class TempMonitorWidget(QWidget):
     def __init__(self):
@@ -237,30 +469,42 @@ class TempMonitorWidget(QWidget):
         self.tray.setVisible(True)
 
     def read_smart_data(self):
+        target, dev_type, label = resolve_target_device(self.config)
+        
+        # 1. On Linux, if target is an internal NVMe, read directly via /sys/class/hwmon (no root needed)
+        if not IS_WINDOWS and (dev_type == "nvme" or (target and "nvme" in target)):
+            s1, s2, comp, err = read_hwmon_nvme(target)
+            if s1 is not None or s2 is not None:
+                return s1, s2, comp, None
+
+        # 2. Try smartctl
         smartctl = self.config.get("smartctl_path", "")
         if not smartctl or not os.path.exists(smartctl):
             smartctl = shutil.which("smartctl") or ("/usr/sbin/smartctl" if not IS_WINDOWS else DEFAULT_CONFIG["smartctl_path"])
             
         if not os.path.exists(smartctl) and not shutil.which(smartctl):
+            if not IS_WINDOWS:
+                s1, s2, comp, err = read_hwmon_nvme(target)
+                if s1 is not None or s2 is not None:
+                    return s1, s2, comp, None
             return None, None, None, f"smartctl not found at {smartctl}"
             
-        target = self.config.get("target_device", "/dev/sdc")
-        dev_type = self.config.get("device_type", "sntrealtek")
-        
         cmd = [smartctl, "-j", "-A"]
         if dev_type:
             cmd.extend(["-d", dev_type])
         cmd.append(target)
         
+        startupinfo = None
+        creationflags = 0
+        if IS_WINDOWS:
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = 0
+            creationflags = 0x08000000  # CREATE_NO_WINDOW
+
+        data = None
+        err_msg = None
         try:
-            startupinfo = None
-            creationflags = 0
-            if IS_WINDOWS:
-                startupinfo = subprocess.STARTUPINFO()
-                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                startupinfo.wShowWindow = 0
-                creationflags = 0x08000000  # CREATE_NO_WINDOW
-            
             p = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -269,12 +513,43 @@ class TempMonitorWidget(QWidget):
                 creationflags=creationflags
             )
             out, err = p.communicate(timeout=3)
-            data = json.loads(out.decode("utf-8", errors="ignore"))
-            
-            composite_temp = None
-            s1 = None
-            s2 = None
-            
+            raw = out.decode("utf-8", errors="ignore")
+            if raw.strip():
+                data = json.loads(raw)
+        except Exception as e:
+            err_msg = str(e)
+
+        # On Linux: check if permission denied, attempt sudo -n
+        is_permission_error = False
+        if data and "smartctl" in data and "messages" in data["smartctl"]:
+            for m in data["smartctl"]["messages"]:
+                if "permission denied" in m.get("string", "").lower():
+                    is_permission_error = True
+                    err_msg = m.get("string")
+                    break
+
+        if not IS_WINDOWS and not is_admin() and (is_permission_error or (not data and err_msg)):
+            try:
+                p = subprocess.Popen(
+                    ["sudo", "-n"] + cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE
+                )
+                out, err = p.communicate(timeout=3)
+                raw = out.decode("utf-8", errors="ignore")
+                if raw.strip():
+                    sudo_data = json.loads(raw)
+                    if "nvme_smart_health_information_log" in sudo_data or "temperature" in sudo_data:
+                        data = sudo_data
+                        err_msg = None
+            except:
+                pass
+
+        composite_temp = None
+        s1 = None
+        s2 = None
+
+        if data:
             if "temperature" in data and "current" in data["temperature"]:
                 composite_temp = data["temperature"]["current"]
             elif "nvme_smart_health_information_log" in data:
@@ -291,10 +566,19 @@ class TempMonitorWidget(QWidget):
                 s1 = composite_temp
             if s2 is None:
                 s2 = composite_temp
-            
-            return s1, s2, composite_temp, None
-        except Exception as e:
-            return None, None, None, str(e)
+
+        # Fallback to hwmon on Linux if smartctl returned no sensor data
+        if not IS_WINDOWS and s1 is None and s2 is None:
+            hs1, hs2, hcomp, herr = read_hwmon_nvme(target)
+            if hs1 is not None or hs2 is not None:
+                return hs1, hs2, hcomp, None
+
+        if s1 is None and s2 is None:
+            if not err_msg and data and "smartctl" in data and "messages" in data["smartctl"]:
+                err_msg = "; ".join(m.get("string", "") for m in data["smartctl"]["messages"])
+            return None, None, None, err_msg or "No temperature data available"
+
+        return s1, s2, composite_temp, None
 
     def update_temperature(self):
         s1, s2, composite, err = self.read_smart_data()
@@ -305,6 +589,10 @@ class TempMonitorWidget(QWidget):
             self.badge_status.setText("DISC")
             self.badge_status.setStyleSheet("background-color: #64748b; color: #ffffff; border-radius: 4px; padding: 1px 6px; font-size: 9px; font-weight: 700;")
             self.update_container_style("#64748b")
+            tip = f"Device: {self.config.get('target_device')}\nStatus: Disconnected / No Data"
+            if err:
+                tip += f"\nError: {err}"
+            self.setToolTip(tip)
             return
 
         target_s2 = s2 if s2 is not None else s1
@@ -344,6 +632,11 @@ class TempMonitorWidget(QWidget):
         self.badge_status.setStyleSheet(f"background-color: {badge_bg}; color: #ffffff; border-radius: 4px; padding: 1px 6px; font-size: 9px; font-weight: 700;")
         self.update_container_style(color)
         
+        tip = f"Device: {self.label_drive.text()} ({self.config.get('target_device')})\nSensor 2 (Controller): {target_s2}°C\nSensor 1 (Flash): {s1}°C"
+        if composite is not None:
+            tip += f"\nComposite: {composite}°C"
+        self.setToolTip(tip)
+
         if self.config.get("enable_notifications", True) and status != self.last_status:
             if status == "CRITICAL!":
                 self.tray.showMessage(
@@ -400,11 +693,32 @@ class TempMonitorWidget(QWidget):
             act.triggered.connect(lambda chk, s=sec: self.set_refresh_rate(s))
 
         drive_menu = menu.addMenu("Select Drive")
-        act_realtek = drive_menu.addAction("USB-C NVMe (Realtek)")
-        act_realtek.triggered.connect(lambda: self.switch_drive("/dev/sdc", "sntrealtek", "USB-C NVMe (Realtek)"))
+        drives = scan_drives()
+        active_target = self.config.get("target_device")
         
-        act_kingston = drive_menu.addAction("Internal M.2 NVMe (Kingston)")
-        act_kingston.triggered.connect(lambda: self.switch_drive("/dev/sdb", "nvme", "Internal NVMe"))
+        if drives:
+            for d in drives:
+                dev = d["device"]
+                dtype = d["type"]
+                lbl = d["label"]
+                is_active = (dev == active_target)
+                prefix = "● " if is_active else "   "
+                act = drive_menu.addAction(f"{prefix}{lbl} [{dev}]")
+                act.triggered.connect(lambda chk, t=dev, dt=dtype, l=lbl: self.switch_drive(t, dt, l))
+            drive_menu.addSeparator()
+            act_rescan = drive_menu.addAction("🔄 Rescan Drives")
+            act_rescan.triggered.connect(self.rescan_drives)
+        else:
+            if IS_WINDOWS:
+                act_realtek = drive_menu.addAction("USB-C NVMe (Realtek) [/dev/sdc]")
+                act_realtek.triggered.connect(lambda: self.switch_drive("/dev/sdc", "sntrealtek", "USB-C NVMe (Realtek)"))
+                act_kingston = drive_menu.addAction("Internal M.2 NVMe (Kingston) [/dev/sdb]")
+                act_kingston.triggered.connect(lambda: self.switch_drive("/dev/sdb", "nvme", "Internal NVMe"))
+            else:
+                act_realtek = drive_menu.addAction("USB-C NVMe (Realtek) [/dev/sdb]")
+                act_realtek.triggered.connect(lambda: self.switch_drive("/dev/sdb", "sntrealtek", "USB-C NVMe (Realtek)"))
+                act_kingston = drive_menu.addAction("Internal M.2 NVMe (Kingston) [/dev/nvme0]")
+                act_kingston.triggered.connect(lambda: self.switch_drive("/dev/nvme0", "nvme", "Internal NVMe"))
 
         menu.addSeparator()
 
@@ -431,10 +745,19 @@ class TempMonitorWidget(QWidget):
         self.timer.setInterval(sec * 1000)
         save_config(self.config)
 
+    def rescan_drives(self):
+        resolve_target_device(self.config)
+        self.label_drive.setText(self.config.get("device_label", "NVMe Drive"))
+        self.update_temperature()
+
     def switch_drive(self, target, dev_type, label):
         self.config["target_device"] = target
         self.config["device_type"] = dev_type
         self.config["device_label"] = label
+        if IS_WINDOWS:
+            self.config["target_device_windows"] = target
+        else:
+            self.config["target_device_linux"] = target
         self.label_drive.setText(label)
         self.max_s2 = None
         self.label_max_s2.setText("Peak: --°C")
